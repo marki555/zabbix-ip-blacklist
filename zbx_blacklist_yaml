@@ -1,0 +1,222 @@
+zabbix_export:
+  version: '6.0'
+  date: '2026-02-12T13:59:04Z'
+  groups:
+    - uuid: 7df96b18c230490a9a0a9e2307226338
+      name: Templates
+  templates:
+    - uuid: 93abb1db45b84c01bd78d49187c69745
+      template: Tpl_Marki_Blacklist
+      name: Tpl_Marki_Blacklist
+      description: |
+        Check host IP in multiple RBL blacklists via MXToolbox and/or HetrixTools APIs.
+        
+        Current version: https://github.com/marki555/zabbix-ip-blacklist
+        Based on bash version: https://github.com/a-stoyanov/zabbix-domain-blacklist
+      groups:
+        - name: Templates
+      items:
+        - uuid: 29eb5405bc23467987c73b70911e8f38
+          name: 'Blacklist count for this host IP'
+          type: DEPENDENT
+          key: 'rbl_checks.count[{HOST.IP}]'
+          delay: '0'
+          history: 7d
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.count
+          master_item:
+            key: 'rbl_checks[{HOST.IP}]'
+          tags:
+            - tag: component
+              value: blacklist
+          triggers:
+            - uuid: b523f4f6378e4d4cb538bb91e92b3c9f
+              expression: 'last(/Tpl_Marki_Blacklist/rbl_checks.count[{HOST.IP}])>={$BLACKLIST_CRITICAL_CNT}'
+              name: 'IP {HOST.IP} found on >={$BLACKLIST_CRITICAL_CNT} blacklists'
+              priority: HIGH
+              description: 'You can check the blacklist names in the history of the raw item'
+            - uuid: 1ac0983a18454a7db8800aea13c4ba5d
+              expression: 'last(/Tpl_Marki_Blacklist/rbl_checks.count[{HOST.IP}])>={$BLACKLIST_WARNING_CNT}'
+              name: 'IP {HOST.IP} found on >={$BLACKLIST_WARNING_CNT} blacklists'
+              priority: AVERAGE
+              description: 'You can check the blacklist names in the history of the raw item'
+              dependencies:
+                - name: 'IP {HOST.IP} found on >={$BLACKLIST_CRITICAL_CNT} blacklists'
+                  expression: 'last(/Tpl_Marki_Blacklist/rbl_checks.count[{HOST.IP}])>={$BLACKLIST_CRITICAL_CNT}'
+        - uuid: fddd63c963864a13a5c5f32017729461
+          name: 'Blacklist error state'
+          type: DEPENDENT
+          key: 'rbl_checks.error[{HOST.IP}]'
+          delay: '0'
+          history: 1d
+          trends: '0'
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.error
+          master_item:
+            key: 'rbl_checks[{HOST.IP}]'
+          tags:
+            - tag: component
+              value: blacklist
+          triggers:
+            - uuid: 7763a17e42874834bc1e4717d4e68141
+              expression: 'last(/Tpl_Marki_Blacklist/rbl_checks.error[{HOST.IP}])<>""'
+              name: 'Blacklist API error'
+              priority: INFO
+        - uuid: e238cfba624b4bb8bd3a4195ef9837ac
+          name: 'Blacklist check (raw item)'
+          type: SCRIPT
+          key: 'rbl_checks[{HOST.IP}]'
+          delay: 3h
+          history: 7d
+          trends: '0'
+          value_type: CHAR
+          params: |
+            // Zabbix Script Item
+            // Parameters: ip (required)
+            
+            function normalizeMacro(value, macroName) {
+                var macroLiteral = "{$" + macroName + "}";
+                if (!value || value === macroLiteral) {
+                    return "";
+                }
+                return value;
+            }
+            
+            function normalizeBlacklistName(name) {
+                switch (name) {
+                    case "SURBL multi": return "multi.surbl.org";
+                    case "Nordspam DBL": return "NordSpam";
+                    case "Spamhaus DBL": return "dbl.spamhaus.org";
+                    case "ivmURI": return "invaluement URI";
+                    default: return name;
+                }
+            }
+            
+            function httpGet(url, headers) {
+                var req = new HttpRequest();
+                for (var i = 0; i < headers.length; i++) {
+                    req.addHeader(headers[i]);
+                }
+                var body = req.get(url);
+                var status = req.getStatus();
+                var size = body ? body.length : 0;
+                return { status: status, body: body, size: size };
+            }
+            
+            
+            var params = JSON.parse(value);
+            var ip = (params && params.ip) ? String(params.ip).trim() : "";
+            var mxtKey = normalizeMacro("{$MXTOOLBOX_API_KEY}", "MXTOOLBOX_API_KEY");
+            var hetKey = normalizeMacro("{$HETRIXTOOLS_API_KEY}", "HETRIXTOOLS_API_KEY");
+            
+            if (!ip) {
+                return JSON.stringify({ count: 0, names: [], error: "missing ip" });
+            }
+            if (!mxtKey && !hetKey) {
+                return JSON.stringify({ count: 0, names: [], error: "missing at least 1 api key" });
+            }
+            
+            var MXTOOLBOX_SERVICE = "https://mxtoolbox.com/api/v1/lookup/blacklist";
+            var HETRIXTOOLS_SERVICE = "https://api.hetrixtools.com/v2";
+            
+            var mxtNames = [];
+            var hetNames = [];
+            var mxtAttempted = false;
+            var hetAttempted = false;
+            var mxtOk = false;
+            var hetOk = false;
+            
+            if (mxtKey) {
+                mxtAttempted = true;
+                try {
+                    var mxtUrl = MXTOOLBOX_SERVICE + "/" + encodeURIComponent(ip) + "?authorization=" + encodeURIComponent(mxtKey);
+                    var mxtRes = httpGet(mxtUrl, ["User-Agent: Mozilla/5.0 (curl)"]);
+                    if (mxtRes.body && mxtRes.body.indexOf("Invalid ApiKey") === -1) {
+                        var mxtJson = JSON.parse(mxtRes.body);
+                        if (mxtJson && (mxtJson.Passed || mxtJson.Failed || mxtJson.Errors)) {
+                            if (mxtJson.Failed && mxtJson.Failed.length) {
+                                for (var i = 0; i < mxtJson.Failed.length; i++) {
+                                    var rawName = String(mxtJson.Failed[i].Name || "").trim();
+                                    if (rawName) {
+                                        mxtNames.push(normalizeBlacklistName(rawName));
+                                    }
+                                }
+                            }
+                            mxtOk = true;
+                        }
+                    }
+                } catch (e) {
+                    // Handled by mxtOk flag.
+                }
+            }
+            
+            if (hetKey) {
+                hetAttempted = true;
+                try {
+                    var hetUrl = HETRIXTOOLS_SERVICE + "/" + encodeURIComponent(hetKey) + "/blacklist-check/ip/" + encodeURIComponent(ip) + "/";
+                    var hetRes = httpGet(hetUrl, ["User-Agent: Mozilla/5.0 (curl)", "Accept: application/json"]);
+                    var hetJson = JSON.parse(hetRes.body);
+            
+                    if (hetJson && hetJson.status !== "ERROR") {
+                        if (hetJson.blacklisted_on && hetJson.blacklisted_on.length) {
+                            for (var j = 0; j < hetJson.blacklisted_on.length; j++) {
+                                var rbl = String(hetJson.blacklisted_on[j].rbl || "").trim();
+                                if (rbl) {
+                                    hetNames.push(rbl);
+                                }
+                            }
+                        }
+                        hetOk = true;
+                    }
+                } catch (e2) {
+                    // Handled by hetOk flag.
+                }
+            }
+            
+            if ((mxtAttempted && !mxtOk && !hetOk) || (hetAttempted && !hetOk && !mxtOk)) {
+                return JSON.stringify({ count: 0, names: [], error: "API lookup failed", ip: ip });
+            }
+            
+            var nameSet = {};
+            var allNames = [];
+            
+            for (var a = 0; a < mxtNames.length; a++) {
+                var n1 = mxtNames[a];
+                if (!nameSet[n1]) {
+                    nameSet[n1] = true;
+                    allNames.push(n1);
+                }
+            }
+            for (var b = 0; b < hetNames.length; b++) {
+                var n2 = hetNames[b];
+                if (!nameSet[n2]) {
+                    nameSet[n2] = true;
+                    allNames.push(n2);
+                }
+            }
+            
+            return JSON.stringify({ count: allNames.length, names: allNames, error: "", ip: ip });
+          description: 'Returns JSON with "count", "names" array, and optionally "error". Item name cannot contain host macros, but triggers can.'
+          timeout: 30s
+          parameters:
+            - name: ip
+              value: '{HOST.IP}'
+          tags:
+            - tag: component
+              value: blacklist
+            - tag: data
+              value: raw
+      macros:
+        - macro: '{$BLACKLIST_CRITICAL_CNT}'
+          value: '2'
+          description: 'threshold for trigger "many"'
+        - macro: '{$BLACKLIST_WARNING_CNT}'
+          value: '1'
+          description: 'threshold for trigger "some"'
+        - macro: '{$HETRIXTOOLS_API_KEY}'
+        - macro: '{$MXTOOLBOX_API_KEY}'
